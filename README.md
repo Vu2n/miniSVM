@@ -1,6 +1,6 @@
 # miniSVM — a from-scratch AMD-V hypervisor that boots Windows
 
-BEFORE PEOPLE COMPLAIN: CLAUDE DOCUMENTED THE CODE AND WROTE THE DOCS!
+⚠️ **BEFORE PEOPLE COMPLAIN: CLAUDE DOCUMENTED THE CODE AND WROTE THE DOCS!** ⚠️
 
 miniSVM is a tiny, heavily-commented **Type-1 hypervisor** written from nothing.
 It boots as a UEFI application, enters **AMD-V (SVM)**, virtualizes its *own*
