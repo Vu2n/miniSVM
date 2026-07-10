@@ -1,0 +1,17 @@
+# Build output
+/build/
+/esp/EFI/BOOT/BOOTX64.EFI
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+
+# QEMU runtime
+OVMF_VARS.fd
+*.iso
+serial.log
+*.log
+
+# Local editor / agent settings
+/.claude/
