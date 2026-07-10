@@ -98,8 +98,6 @@ tutorial.
 | M11 | **Chainload Windows as a guest** | hosting a real OS |
 | + | VMI, memory protection | introspection & integrity |
 
-*(Next up: M12 — SMP, so the guest can use more than one core.)*
-
 ---
 
 ## How it works (the interesting bits)
