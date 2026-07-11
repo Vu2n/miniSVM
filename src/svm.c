@@ -155,6 +155,18 @@ extern UINT64 hv_resident(UINT64 guest_vmcb_pa, UINT64 host_vmcb_pa,
 #define HC_NPT_DONE       0x30        // guest wrote via its NPT-redirected page
                                       // (pointer was pre-loaded into guest RDI)
 
+// ---- Guest tools hypercall ABI --------------------------------------------
+// A program running INSIDE the guest (e.g. minictl.exe) talks to the hypervisor
+// by putting HV_MAGIC in RAX and a command in RCX, then executing VMMCALL. We
+// answer in RAX. VMMCALL is already intercepted and the OS never uses it, so
+// this channel is free.
+#define HV_MAGIC          0x4D696E69534D31ull   // "1MSiniM" - our handshake key
+#define HV_REPLY          0xC0FFEEC0FFEEull     // ping reply -> "I'm here"
+#define HVC_PING          0                     // -> HV_REPLY
+#define HVC_EXITS         1                     // -> total #VMEXITs serviced
+#define HVC_WINVER        2                     // -> Windows major version (VMI)
+#define HVC_VERSION       3                     // -> hypervisor version
+
 // Length in bytes of the instructions we advance past (fallback when the CPU
 // does not report the next RIP via NRIPS).
 #define VMMCALL_LEN       3
@@ -531,6 +543,8 @@ static void *guest_va_to_host(vmcb *v, UINT64 gva) {
     return a < lim ? (void *)a : NULL;
 }
 
+static UINT64 g_win_major = 0;   // Windows major version, captured by VMI below
+
 // Read a few well-known fields out of KUSER_SHARED_DATA (a fixed kernel address
 // that every Windows maps) - proof the hypervisor can read the live OS's own
 // memory. NtSystemRoot ("C:\Windows") and the version live at stable offsets.
@@ -547,27 +561,12 @@ static void hv_vmi_windows(vmcb *v) {
         dbg_puts("\r\n");
     }
     if (maj && min) {
+        g_win_major = *maj;
         dbg_hex("[VMI]   NtMajorVersion : ", *maj);
         dbg_hex("[VMI]   NtMinorVersion : ", *min);
     }
     dbg_hex("[VMI]   (walked via guest CR3 = ", v->save.cr3);
     dbg_puts("[VMI] === we just read that out of Windows' own address space ===\r\n\r\n");
-}
-
-// Return a pointer to the 2 MiB NPT leaf entry (PDE with PS=1) that maps a given
-// guest-physical address, so we can change its permissions. NULL if not a 2 MiB
-// leaf. The NPT pages are host-physical == host-virtual (identity host CR3).
-static UINT64 *npt_2mb_entry(UINT64 n_cr3, UINT64 gpa) {
-    UINT64 M = 0x000FFFFFFFFFF000ull;
-    UINT64 *pml4 = (UINT64 *)(n_cr3 & M);
-    UINT64 e = pml4[(gpa >> 39) & 0x1FF];
-    if (!(e & 1)) return NULL;
-    UINT64 *pdpt = (UINT64 *)(e & M);
-    e = pdpt[(gpa >> 30) & 0x1FF];
-    if (!(e & 1) || (e & 0x80)) return NULL;   // must point to a PD, not a 1 GiB leaf
-    UINT64 *pd = (UINT64 *)(e & M);
-    UINT64 *pde = &pd[(gpa >> 21) & 0x1FF];
-    return (*pde & 0x80) ? pde : NULL;         // must be a 2 MiB leaf
 }
 
 // hv_handle_exit is called (from vmrun.asm's resident loop) on every #VMEXIT
@@ -592,10 +591,6 @@ void hv_handle_exit(vmcb *v, guest_gprs *g) {
     // intercept + NPT), so Windows is still our guest, just faster.
     static BOOLEAN vmi_done = FALSE;
     static UINT64 kexits = 0;
-    // Memory-protection state (used here and in the #NPF handler below).
-    static BOOLEAN memprot_on = FALSE;
-    static UINT64 *memprot_pde = NULL;
-    static UINT64 memprot_base = 0;
     if (v->save.rip >= 0xFFFF800000000000ull) {
         if (!kernel_seen) {
             kernel_seen = TRUE;
@@ -609,20 +604,6 @@ void hv_handle_exit(vmcb *v, guest_gprs *g) {
             if (ver && *ver) {
                 hv_vmi_windows(v);
                 dbg_hex("[hv] exits serviced to reach the Windows kernel: ", exits);
-
-                // FEATURE - NPT memory protection: lock the 2 MiB region holding
-                // KUSER_SHARED_DATA read-only, so we catch the next guest write.
-                UINT64 kgpa = (UINT64)guest_va_to_host(v, 0xFFFFF78000000000ull);
-                UINT64 *pde = kgpa ? npt_2mb_entry(v->control.n_cr3, kgpa) : NULL;
-                if (pde && (*pde & 2)) {
-                    memprot_pde = pde;
-                    memprot_base = kgpa & ~0x1FFFFFull;
-                    *pde &= ~2ull;                 // clear R/W -> read-only
-                    v->control.tlb_control = 3;    // flush this guest's TLB
-                    memprot_on = TRUE;
-                    dbg_puts("[MEMPROT] locked KUSER_SHARED_DATA's page READ-ONLY;\r\n");
-                    dbg_puts("[MEMPROT] waiting to catch Windows writing to it...\r\n");
-                }
                 vmi_done = TRUE;
             } else if (kexits > 40000) {
                 dbg_puts("[hv] (VMI: kernel data not readable; skipping)\r\n");
@@ -669,31 +650,26 @@ void hv_handle_exit(vmcb *v, guest_gprs *g) {
     }
 
     if (code == VMEXIT_VMMCALL) {
+        // Guest tools channel: RAX == HV_MAGIC means a program inside the guest
+        // (e.g. minictl.exe) is calling us. The command is in RCX; we answer in
+        // RAX. Works from any privilege level, since VMMCALL traps to us.
+        if (v->save.rax == HV_MAGIC) {
+            switch (g->rcx) {
+                case HVC_PING:    v->save.rax = HV_REPLY;      break;
+                case HVC_EXITS:   v->save.rax = exits;         break;
+                case HVC_WINVER:  v->save.rax = g_win_major;   break;
+                case HVC_VERSION: v->save.rax = 0x00010000;    break;  // v1.0
+                default:          v->save.rax = 0;             break;
+            }
+        }
         v->save.rip = v->control.nrip ? v->control.nrip
                                       : v->save.rip + VMMCALL_LEN;
         return;
     }
 
     if (code == VMEXIT_NPF) {
-        UINT64 fault_gpa = v->control.exit_info2;
-
-        // FEATURE - memory protection: did the guest just write to the page we
-        // locked read-only? Catch it red-handed, name the culprit, then release
-        // the lock so Windows carries on.
-        if (memprot_on && memprot_pde &&
-            fault_gpa >= memprot_base && fault_gpa < memprot_base + 0x200000) {
-            // Restore R/W FIRST and resume as fast as possible - the guest is
-            // paused mid-instruction (maybe in an ISR), so keep the stall tiny.
-            *memprot_pde |= 2ull;              // restore R/W
-            v->control.tlb_control = 3;        // flush this guest's TLB
-            memprot_on = FALSE;
-            dbg_puts("[MEMPROT] caught guest write to locked page; RIP=");
-            dbg_hex("", v->save.rip);          // one short line, then resume
-            return;
-        }
-
-        // Otherwise: an unexpected NPF. With a correct, persistent, identity NPT
-        // these should not happen for mapped RAM - but if one does, log a few and
+        // An unexpected NPF. With a correct, persistent, identity NPT these
+        // should not happen for mapped RAM - but if one does, log a few and
         // resume (re-execute). If the SAME guest-physical page faults over and
         // over we are genuinely stuck, so report it and stop.
         static UINT64 last_gpa = ~0ull;

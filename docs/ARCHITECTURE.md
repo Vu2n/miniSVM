@@ -92,14 +92,19 @@ uses this to read `KUSER_SHARED_DATA` (a page every Windows maps at a fixed
 kernel address) and print `NtSystemRoot` and the OS version — read straight out
 of the live guest.
 
-## 9. Memory-write protection
+## 9. Guest ↔ hypervisor channel
 
-The hypervisor clears the R/W bit on the NPT leaf covering a chosen page and
-flushes the nested TLB (`VMCB.TLB_CONTROL`). The next guest write faults with
-`#NPF`; the handler identifies the offending guest RIP, restores R/W, and
-resumes. It's the same mechanism as HVCI/kernel-integrity — applied here to
-`KUSER_SHARED_DATA` as a one-shot demo (that page is safety-critical, so the
-catch is deliberately fast to avoid stalling the kernel).
+`VMMCALL` is intercepted (and no OS uses it), so it's a free two-way channel. A
+program inside the guest puts `HV_MAGIC` in `RAX` and a command in `RCX`, then
+executes `VMMCALL`; the hypervisor recognizes the key and answers in `RAX`. The
+[`tools/minictl`](../tools/minictl) program does this from inside Windows and
+prints the live exit count, the hypervisor version, and the Windows version the
+hypervisor read via VMI.
+
+> NPT-based write protection (clear the R/W bit on an NPT leaf, trap the `#NPF`)
+> is the same mechanism HVCI uses and is easy to add here — but trapping writes
+> to a live, safety-critical kernel page can stall the kernel, so it's left as
+> an exercise rather than shipped armed by default.
 
 ## 10. Debugging a blind hypervisor
 

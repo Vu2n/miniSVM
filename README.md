@@ -37,9 +37,7 @@ AMD machine, captured over a virtual serial port:
 [VMI]   NtMajorVersion : 0x000000000000000A     (Windows 10 / 11)
 [VMI] === we just read that out of Windows' own address space ===
 
-[MEMPROT] locked KUSER_SHARED_DATA's page READ-ONLY;
 [hv] disabling CPUID intercept -> guest now runs at native speed.
-[MEMPROT] caught guest write to locked page; RIP=0xFFFFF8017F9FF574
 ```
 
 Every `guest rip=` line is an instruction of the real OS that trapped out to our
@@ -70,9 +68,9 @@ itself, executing under us.
 - 🕵️ **VMI (Virtual Machine Introspection)** — walks the guest's page tables and
   reads live Windows kernel memory (`NtSystemRoot`, version, …). This is the
   exact technique EDR/forensics tools use.
-- 🛡️ **NPT memory-write protection** — locks a page read-only and traps the
-  guest writing to it, naming the offending kernel RIP. The core idea behind
-  HVCI / kernel-integrity enforcement.
+- 📡 **Guest ↔ hypervisor channel** — a `VMMCALL` hypercall ABI, plus
+  [`minictl.exe`](tools/minictl) you run *inside* Windows to query the
+  hypervisor beneath it (live exit count, version, VMI data).
 - 🔬 **Runs on real AMD hardware** (validated on VMware Workstation with
   *Virtualize AMD-V/RVI*), and **in QEMU** for fast iteration.
 
@@ -96,7 +94,7 @@ tutorial.
 | M9 | **Self-virtualization** | virtualizing your own execution |
 | M10 | Persist + own page tables + survive `ExitBootServices` | staying resident |
 | M11 | **Chainload Windows as a guest** | hosting a real OS |
-| + | VMI, memory protection | introspection & integrity |
+| + | VMI + guest hypercall channel | introspection & guest tools |
 
 ---
 
