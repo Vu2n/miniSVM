@@ -94,6 +94,7 @@ tutorial.
 | M9 | **Self-virtualization** | virtualizing your own execution |
 | M10 | Persist + own page tables + survive `ExitBootServices` | staying resident |
 | M11 | **Chainload Windows as a guest** | hosting a real OS |
+| M12 | **SMP** — virtualize every core (MP Services + per-core self-virt) | multi-core |
 | + | VMI + guest hypercall channel | introspection & guest tools |
 
 ---

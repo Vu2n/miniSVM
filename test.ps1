@@ -19,7 +19,7 @@ $esp  = Join-Path $root 'esp'
 $log  = Join-Path $root 'build\serial.log'
 if (Test-Path $log) { Clear-Content $log }
 
-$a = "-machine q35 -m 256 -cpu qemu64,+svm " +
+$a = "-machine q35 -m 256 -cpu qemu64,+svm -smp 4 " +
      "-drive `"if=pflash,format=raw,readonly=on,file=$code`" " +
      "-drive `"format=raw,file=fat:rw:$esp`" " +
      "-serial `"file:$log`" -display none -no-reboot"

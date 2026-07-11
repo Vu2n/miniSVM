@@ -119,6 +119,42 @@ static BOOLEAN chainload_windows(EFI_HANDLE image, EFI_BOOT_SERVICES *bs) {
     return FALSE;
 }
 
+// Runs on each Application Processor via MP Services. Enables SVM on this core
+// (per-core state), then self-virtualizes the core so it comes up as a guest -
+// after which everything the AP runs (Windows' AP-startup code included) is a
+// guest under us. Raw serial is AP-safe; the firmware console is not.
+static volatile UINTN g_ap_slot = 0;
+static volatile UINTN g_ap_ok = 0;
+static void EFIAPI ap_virtualize(VOID *arg) {
+    (void)arg;
+    UINTN i = ++g_ap_slot;                 // MP StartupAllAPs is single-threaded
+    UINT64 vm_cr = __readmsr(MSR_VM_CR);
+    if (vm_cr & VM_CR_SVMDIS)
+        __writemsr(MSR_VM_CR, vm_cr & ~VM_CR_SVMDIS);
+    __writemsr(MSR_EFER, __readmsr(MSR_EFER) | EFER_SVME);
+
+    svm_virtualize_ap((int)i);             // self-virtualize: returns as a guest
+
+    // Executing here as a guest of our own hypervisor on this core.
+    g_ap_ok++;
+    serial_puts("[M12]   this AP is now running as a guest\r\n");
+}
+
+// Locate the MP Services protocol (or NULL). It lets us run code on the APs
+// while they're still parked in firmware, before any OS starts them.
+static EFI_MP_SERVICES_PROTOCOL *find_mp_services(EFI_BOOT_SERVICES *bs) {
+    static EFI_GUID mpGuid = EFI_MP_SERVICES_PROTOCOL_GUID;
+    EFI_HANDLE handles[8];
+    UINTN sz = sizeof(handles);
+    if (EFI_ERROR(bs->LocateHandle(ByProtocol, &mpGuid, NULL, &sz, handles)) ||
+        sz < sizeof(EFI_HANDLE))
+        return NULL;
+    EFI_MP_SERVICES_PROTOCOL *mp = NULL;
+    if (EFI_ERROR(bs->HandleProtocol(handles[0], &mpGuid, (VOID **)&mp)))
+        return NULL;
+    return mp;
+}
+
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     (void)ImageHandle;
     con_init(SystemTable);
@@ -186,6 +222,38 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     print_line(L"[M4] final #VMEXIT code   : ", res.exit_code);
     print_line(L"[M4] guest RIP at exit    : ", res.guest_rip);
     print(L"\r\n[*] SUCCESS - the guest ran and we serviced its exits.\r\n");
+
+    // --- M12: SMP foundation -----------------------------------------------
+    // Enumerate the CPU cores and prove we can run code on the other ones via
+    // UEFI MP Services. This is the beachhead for multi-core: SMP.2 will make
+    // ap_startup enable SVM and self-virtualize each core here.
+    print(L"\r\n[M12] SMP: probing for other CPU cores...\r\n");
+    {
+        EFI_MP_SERVICES_PROTOCOL *mp = find_mp_services(SystemTable->BootServices);
+        if (!mp) {
+            print(L"[M12] MP Services not available (firmware/1 vCPU); skipping.\r\n");
+        } else {
+            UINTN total = 0, enabled = 0;
+            mp->GetNumberOfProcessors(mp, &total, &enabled);
+            print_line(L"[M12] logical processors : ", total);
+            if (total > 1) {
+                EFI_BOOT_SERVICES *bs = SystemTable->BootServices;
+                BOOLEAN ok = svm_build_ap_tables(bs);
+                for (UINTN i = 1; i < total && i < 64 && ok; i++)
+                    ok = svm_alloc_ap(bs, (int)i);
+                if (!ok) {
+                    print(L"[M12] FAIL: could not allocate per-core state.\r\n");
+                } else {
+                    print(L"[M12] self-virtualizing every AP...\r\n");
+                    mp->StartupAllAPs(mp, ap_virtualize, TRUE, NULL, 0, NULL, NULL);
+                    print_line(L"[M12] cores now virtualized (APs): ", g_ap_ok);
+                    print(L"[M12] OK: every core is a guest of miniSVM.\r\n");
+                }
+            } else {
+                print(L"[M12] only 1 core online (give the VM 2+ vCPUs to test SMP).\r\n");
+            }
+        }
+    }
 
     // --- M9: self-virtualization -------------------------------------------
     // Up to here the "guest" was a separate blob. Now we virtualize OUR OWN

@@ -818,3 +818,58 @@ void svm_go_resident(EFI_HANDLE image, EFI_BOOT_SERVICES *bs) {
 
     fn(guest_pa, host_pa, gc, hstack_top);     // enter: returns as a guest
 }
+
+// ---- SMP: virtualize the other CPU cores (M12) -----------------------------
+//
+// Each Application Processor gets its own VMCB, host VMCB, host stack and HSAVE
+// (allocated by the BSP, since APs can't safely call boot services), plus a
+// shared identity NPT and host page table. On the AP, svm_virtualize_ap()
+// self-virtualizes that core exactly like svm_go_resident does for the BSP.
+#define MAX_CPUS 64
+typedef struct {
+    UINT64 guest_vmcb, host_vmcb, host_stack_top, hsave;
+    guest_gprs gctx;
+} ap_state_t;
+static ap_state_t g_ap[MAX_CPUS];
+static UINT64 g_ap_npt = 0, g_ap_hostpt = 0;
+
+// BSP: build the NPT + host page tables shared by every AP (identity, so one
+// copy is fine for all of them). Call once before starting the APs.
+BOOLEAN svm_build_ap_tables(EFI_BOOT_SERVICES *bs) {
+    g_ap_npt    = npt_build(bs, 0, 0);
+    g_ap_hostpt = hostpt_build(bs);
+    return g_ap_npt && g_ap_hostpt;
+}
+
+// BSP: pre-allocate the per-core memory for AP slot `i` (1..N-1).
+BOOLEAN svm_alloc_ap(EFI_BOOT_SERVICES *bs, int i) {
+    if (i <= 0 || i >= MAX_CPUS) return FALSE;
+    ap_state_t *s = &g_ap[i];
+    s->guest_vmcb = alloc_page(bs);
+    s->host_vmcb  = alloc_page(bs);
+    s->hsave      = alloc_page(bs);
+    UINT64 stk = 0;
+    if (EFI_ERROR(bs->AllocatePages(AllocateAnyPages, EfiRuntimeServicesData, 8, &stk)))
+        return FALSE;
+    s->host_stack_top = stk + 8 * 4096;
+    return s->guest_vmcb && s->host_vmcb && s->hsave;
+}
+
+// AP: virtualize THIS core using pre-allocated slot `i`. Minimal intercepts
+// (only the mandatory VMRUN) so a parked AP produces essentially no exits.
+// Self-virtualizes and "returns" already running as a guest.
+void svm_virtualize_ap(int i) {
+    ap_state_t *s = &g_ap[i];
+    __writemsr(MSR_VM_HSAVE_PA, s->hsave);
+
+    vmcb *v = (vmcb *)s->guest_vmcb;
+    fill_current_cpu_state(v);
+    v->control.guest_asid     = (UINT32)(i + 1);
+    v->control.intercept_vec4 = INTERCEPT_VMRUN;   // mandatory only
+    v->control.np_enable      = 1;
+    v->control.n_cr3          = g_ap_npt;
+    v->save.g_pat             = 0x0007040600070406ull;
+
+    __writecr3(g_ap_hostpt);                       // host runs on shared tables
+    hv_resident(s->guest_vmcb, s->host_vmcb, &s->gctx, s->host_stack_top);
+}

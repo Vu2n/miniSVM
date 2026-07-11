@@ -192,3 +192,28 @@ typedef struct _EFI_SIMPLE_FILE_SYSTEM_PROTOCOL {
 
 // A device-path node header (Type/SubType/Length). We build one file-path node.
 typedef struct { UINT8 Type; UINT8 SubType; UINT8 Length[2]; } EFI_DEV_PATH_HDR;
+
+// ---- MP Services Protocol (run code on the other CPU cores) ----------------
+#define EFI_MP_SERVICES_PROTOCOL_GUID \
+    { 0x3FDDA605, 0xA76E, 0x4F46, { 0xAD,0x29,0x12,0xF4,0x53,0x1B,0x3D,0x08 } }
+
+typedef VOID (EFIAPI *EFI_AP_PROCEDURE)(VOID *ProcedureArgument);
+
+typedef struct _EFI_MP_SERVICES_PROTOCOL {
+    EFI_STATUS (EFIAPI *GetNumberOfProcessors)(
+        struct _EFI_MP_SERVICES_PROTOCOL *This,
+        UINTN *NumberOfProcessors, UINTN *NumberOfEnabledProcessors);
+    VOID *GetProcessorInfo;
+    EFI_STATUS (EFIAPI *StartupAllAPs)(
+        struct _EFI_MP_SERVICES_PROTOCOL *This, EFI_AP_PROCEDURE Procedure,
+        BOOLEAN SingleThread, VOID *WaitEvent, UINTN TimeoutInMicroseconds,
+        VOID *ProcedureArgument, UINTN **FailedCpuList);
+    EFI_STATUS (EFIAPI *StartupThisAP)(
+        struct _EFI_MP_SERVICES_PROTOCOL *This, EFI_AP_PROCEDURE Procedure,
+        UINTN ProcessorNumber, VOID *WaitEvent, UINTN TimeoutInMicroseconds,
+        VOID *ProcedureArgument, BOOLEAN *Finished);
+    VOID *SwitchBSP;
+    VOID *EnableDisableAP;
+    EFI_STATUS (EFIAPI *WhoAmI)(struct _EFI_MP_SERVICES_PROTOCOL *This,
+                               UINTN *ProcessorNumber);
+} EFI_MP_SERVICES_PROTOCOL;

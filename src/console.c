@@ -43,8 +43,10 @@ void con_init(EFI_SYSTEM_TABLE *st) { gST = st; }
 
 void print(const CHAR16 *s) {
     gST->ConOut->OutputString(gST->ConOut, (CHAR16 *)s);
-    for (const CHAR16 *p = s; *p; p++)   // mirror to serial (as ASCII)
-        serial_putc((char)*p);
+    // Note: we do NOT mirror to serial here. QEMU's OVMF already routes the UEFI
+    // console to COM1, so mirroring would double it. The important runtime logs
+    // (once the OS is booting and the console is gone) use the raw serial dbg_*
+    // helpers directly.
 }
 
 void print_hex(UINT64 v) {
