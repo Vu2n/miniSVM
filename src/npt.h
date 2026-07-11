@@ -21,3 +21,11 @@ UINT64 npt_build(EFI_BOOT_SERVICES *bs, UINT64 redirect_gpa, UINT64 redirect_hpa
 // This decouples the resident host from the firmware/OS page tables (which get
 // torn down once an OS takes over). Returns the PML4 host-physical address, or 0.
 UINT64 hostpt_build(EFI_BOOT_SERVICES *bs);
+
+// Ensure the 2 MiB region containing `gpa` in the NPT rooted at `pml4_pa` is
+// broken down to 4 KiB pages (splitting the large leaf on demand, using `bs` to
+// allocate the page table), and return a pointer to the 4 KiB PTE for `gpa`. The
+// caller can then clear/set the writable bit (1<<1) to trap or allow writes to
+// that single page (e.g. the local APIC MMIO page). Returns NULL on failure.
+// Must be called at build time (before ExitBootServices) since it allocates.
+UINT64 *npt_pte_ptr(EFI_BOOT_SERVICES *bs, UINT64 pml4_pa, UINT64 gpa);

@@ -6,8 +6,11 @@ miniSVM is a tiny, heavily-commented **Type-1 hypervisor** written from nothing.
 It boots as a UEFI application, enters **AMD-V (SVM)**, virtualizes its *own*
 running code, survives the OS handoff, and then **boots a real, unmodified
 Windows install as its guest — all the way to the desktop — on physical
-hardware.** Along the way it reads live kernel memory out of the running OS and
-reads live kernel memory out of it. And it does all of this across every CPU core.
+hardware, multi-core.** Along the way it reads live kernel memory out of the
+running OS and can answer questions about it from a tool you run *inside* the
+guest. It virtualizes every core at UEFI time and keeps the boot processor
+virtualized for the entire Windows session (the AP-startup story is a deep-dive
+in its own right — see the SMP section below).
 
 No EDK2, no gnu-efi, no hypervisor framework. Just **MSVC + NASM + Python +
 xorriso**, and about a dozen small, readable source files. It's built as a
@@ -70,7 +73,17 @@ itself, executing under us.
   exact technique EDR/forensics tools use.
 - 📡 **Guest ↔ hypervisor channel** — a `VMMCALL` hypercall ABI, plus
   [`minictl.exe`](tools/minictl) you run *inside* Windows to query the
-  hypervisor beneath it (live exit count, version, VMI data).
+  hypervisor beneath it (live exit count, version, VMI data) — from **any** core.
+- 🎯 **Process lookup from underneath** — `minictl find explorer.exe` asks the
+  hypervisor for a PID, and it answers by walking Windows' own `EPROCESS` list
+  from beneath the OS — no driver, no guest cooperation. The primitive behind
+  EDR, anti-cheat, and forensics tools.
+- 🧵 **SMP** — uses UEFI **MP Services** to self-virtualize *every* core before the
+  OS loads, and boots **multi-core** Windows. Plus an opt-in **AP-startup
+  emulator** (`SMP_EMULATE_AP_STARTUP`) — a full xAPIC-MMIO trap + `INIT`/`SIPI`
+  decode + NMI-wake + real-mode reset that drives an application processor into
+  Windows' own startup code. See the SMP write-up for how far it gets and the
+  nested-virtualization wall it hits.
 - 🔬 **Runs on real AMD hardware** (validated on VMware Workstation with
   *Virtualize AMD-V/RVI*), and **in QEMU** for fast iteration.
 
@@ -94,8 +107,9 @@ tutorial.
 | M9 | **Self-virtualization** | virtualizing your own execution |
 | M10 | Persist + own page tables + survive `ExitBootServices` | staying resident |
 | M11 | **Chainload Windows as a guest** | hosting a real OS |
-| M12 | **SMP** — virtualize every core; boots **multi-core** Windows | MP Services, per-core self-virt, INIT/SIPI |
-| + | VMI + guest hypercall channel | introspection & guest tools |
+| M12 | **SMP** — self-virtualize every core at UEFI time; boot **multi-core** Windows | MP Services, per-core self-virt |
+| M12.b | **AP-startup emulator** (opt-in) — trap xAPIC, decode `INIT`/`SIPI`, NMI-wake, real-mode reset | MMIO emulation, single-step, the AMD `INIT` latch |
+| + | VMI + guest hypercall channel + process lookup | introspection & guest tools |
 
 ---
 
@@ -123,6 +137,21 @@ is up).
 **Seeing inside.** VMI translates a guest *virtual* address by walking the
 guest's own page tables (root = guest `CR3`) and then the NPT, landing on a host
 pointer it can read — no cooperation from the guest required.
+
+**Multi-core, and the frontier.** At UEFI time, before the OS exists, miniSVM uses
+the **MP Services Protocol** to run self-virtualization on every application
+processor — so all cores start out as guests. Windows then reclaims them with the
+classic `INIT`/`SIPI` startup sequence, and by default we let it: an un-intercepted
+`INIT` resets each AP out of SVM and it comes up one layer down, giving a stable
+multi-core Windows with the boot processor virtualized throughout. Setting
+`SMP_EMULATE_AP_STARTUP = 1` turns on the real attempt to *keep* the APs as our
+guests — an entire xAPIC-MMIO instruction emulator, `INIT`/`SIPI` decoding, an NMI
+wake to dodge AMD's `INIT`-pending latch, and a hand-built real-mode reset that
+lands the AP in Windows' trampoline. It works right up to Windows' AP-init, which
+can't complete cleanly under *nested* virtualization. The full story — every
+technique and the exact wall — is
+[§11 of the architecture doc](docs/ARCHITECTURE.md#11-smp--virtualizing-the-other-cores-m12).
+It's the most interesting read in the repo.
 
 ---
 
@@ -171,9 +200,18 @@ build.ps1 / test.ps1 / make-iso.ps1   build & test
 
 ## Status & caveats
 
-- Multi-core supported (M12); tested up to 2 vCPUs — more should work but
-  hasn't been exercised.
+- **Multi-core Windows boots** (validated at 6 vCPUs). Every core is
+  self-virtualized at UEFI time; the **boot processor stays a miniSVM guest for
+  the whole session**, while the APs come up one layer below us once Windows
+  starts them (default). Keeping the APs as *our* guests across that handoff is
+  the opt-in AP-startup emulator (`SMP_EMULATE_AP_STARTUP`, off by default) — it
+  drives an AP into Windows' trampoline but doesn't complete AP-init cleanly under
+  nested virtualization; most likely to succeed on bare metal. See
+  [ARCHITECTURE §11](docs/ARCHITECTURE.md).
 - Identity-maps 16 GiB of guest-physical space (fine for typical VM RAM).
+- Legacy **xAPIC** assumed for the AP-startup emulator (Windows on AMD under
+  VMware doesn't enable x2APIC); the cleaner x2APIC MSR path is coded but unused
+  there.
 - Transparent, non-stealth, non-persistent-across-reboot — by design.
 
 ## License

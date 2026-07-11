@@ -137,13 +137,27 @@ extern UINT64 hv_resident(UINT64 guest_vmcb_pa, UINT64 host_vmcb_pa,
 
 // VMCB intercept bits and exit codes we care about.
 #define INTERCEPT_CPUID   (1u << 18)  // vector 3: intercept the CPUID instruction
+#define INTERCEPT_MSR     (1u << 28)  // vector 3: intercept MSR access (per MSRPM)
 #define INTERCEPT_VMRUN   (1u << 0)   // vector 4: required for VMRUN to be legal
 #define INTERCEPT_VMMCALL (1u << 1)   // vector 4: intercept VMMCALL
+#define VMEXIT_DB         0x041ull     // #DB (debug) exception - used for single-step
+#define VMEXIT_NMI        0x061ull     // NMI - our edge-triggered AP wake signal
 #define VMEXIT_INIT       0x063ull     // INIT signal (OS starting this core)
+#define INTERCEPT_NMI     (1u << 1)    // vector-3 bit: intercept NMI
 #define VMEXIT_CPUID      0x072ull
+#define VMEXIT_MSR        0x07Cull     // RDMSR/WRMSR of an intercepted MSR
+#define EXC_DB            (1u << 1)    // intercept_exceptions bit for vector 1 (#DB)
+#define RFLAGS_TF         (1ull << 8)  // trap flag: #DB after each instruction
+#define RFLAGS_IF         (1ull << 9)  // interrupt flag
 #define VMEXIT_VMMCALL    0x081ull
 #define VMEXIT_NPF        0x400ull     // nested page fault (guest-physical)
 #define VMEXIT_INVALID    (~0ull)     // guest state failed consistency checks
+
+// x2APIC Interrupt Command Register (single MSR; a write sends an IPI). We watch
+// this to see the OS start its APs via INIT/SIPI. Delivery mode is bits [10:8]:
+// 5 = INIT, 6 = Startup (SIPI); vector (SIPI trampoline page) is bits [7:0];
+// destination x2APIC ID is bits [63:32].
+#define MSR_X2APIC_ICR    0x830
 
 // Guest -> hypervisor calls: the request number is passed in the guest's RAX.
 #define HC_EXIT           0x00        // guest asks us to stop the run loop
@@ -158,15 +172,43 @@ extern UINT64 hv_resident(UINT64 guest_vmcb_pa, UINT64 host_vmcb_pa,
 
 // ---- Guest tools hypercall ABI --------------------------------------------
 // A program running INSIDE the guest (e.g. minictl.exe) talks to the hypervisor
-// by putting HV_MAGIC in RAX and a command in RCX, then executing VMMCALL. We
-// answer in RAX. VMMCALL is already intercepted and the OS never uses it, so
-// this channel is free.
+// by putting HV_MAGIC in RAX and a command in RCX (and an optional argument in
+// RDX), then executing VMMCALL. We answer in RAX. VMMCALL is already intercepted
+// and the OS never uses it, so this channel is free.
 #define HV_MAGIC          0x4D696E69534D31ull   // "1MSiniM" - our handshake key
 #define HV_REPLY          0xC0FFEEC0FFEEull     // ping reply -> "I'm here"
 #define HVC_PING          0                     // -> HV_REPLY
 #define HVC_EXITS         1                     // -> total #VMEXITs serviced
 #define HVC_WINVER        2                     // -> Windows major version (VMI)
 #define HVC_VERSION       3                     // -> hypervisor version
+#define HVC_FIND_PID      4                     // RDX=ptr to name -> PID (0=none)
+// SMP.3b diagnostics - returned through RAX because the hypervisor's serial
+// writes are swallowed once Windows owns COM1, but the hypercall channel works.
+#define HVC_APICBASE      5                     // -> live IA32_APIC_BASE (bit10=x2apic)
+#define HVC_SMP_COUNT     6                     // -> # INIT/SIPI ICR writes intercepted
+#define HVC_SMP_SIPI      7                     // -> last SIPI ICR value (low byte=vector)
+// SMP.3b xAPIC MMIO emulator, increment 1 (observe the first APIC-page write):
+#define HVC_APIC_FAULTS   8                     // -> # APIC-page NPT write-faults seen
+#define HVC_APIC_RIP      9                     // -> guest RIP of the first APIC write
+#define HVC_APIC_B0       10                    // -> first 8 instruction bytes
+#define HVC_APIC_B1       11                    // -> next 8 instruction bytes
+#define HVC_APIC_GPA      12                    // -> first faulting GPA (low12 = register)
+#define HVC_APIC_INFO1    13                    // -> NPF exit_info1 (bit1 = write)
+#define HVC_DB_COUNT      14                    // -> # completed single-steps (#DB)
+#define HVC_ICR_LO        15                    // -> last ICR-low value (mode+vector)
+#define HVC_ICR_HI        16                    // -> last ICR-high value (destination)
+#define HVC_ICR_COUNT     17                    // -> # ICR sends (IPIs)
+#define HVC_INIT_CNT      18                    // -> # INIT IPIs decoded
+#define HVC_SIPI_CNT      19                    // -> # SIPI IPIs decoded
+#define HVC_SIPI_VEC      20                    // -> SIPI trampoline vector (page<<12)
+#define HVC_APIC_UNDEC    21                    // -> # ICR writes we couldn't decode
+#define HVC_AP_STARTED    22                    // -> # APs that ran their trampoline
+#define HVC_AP_BADEXIT    23                    // -> exit_code of last AP unexpected exit
+#define HVC_AP_BADRIP     24                    // -> guest RIP at that exit
+#define HVC_AP_BADCOUNT   25                    // -> # unexpected exits (AP deaths)
+#define HVC_RM_EXIT       26                    // -> exit_code an AP loops on in real mode
+#define HVC_RM_RIP        27                    // -> guest RIP at that exit
+#define HVC_INIT_LOOPS    28                    // -> max per-AP INIT-handler re-entries
 
 // Length in bytes of the instructions we advance past (fallback when the CPU
 // does not report the next RIP via NRIPS).
@@ -546,6 +588,64 @@ static void *guest_va_to_host(vmcb *v, UINT64 gva) {
 
 static UINT64 g_win_major = 0;   // Windows major version, captured by VMI below
 
+// SMP.3b: what the x2APIC ICR intercept has observed (exposed via hypercall).
+static volatile UINT64 g_ipi_seen  = 0;   // count of INIT/SIPI ICR writes seen
+static volatile UINT64 g_last_sipi = 0;   // last SIPI ICR value (0 = none yet)
+
+// SMP.3b xAPIC MMIO emulator: the local-APIC page is write-protected in the BSP's
+// NPT; the first write faults, we snapshot the instruction, then un-protect so
+// Windows continues (increment 1 = observe). g_apic_pte points at the 4 KiB NPT
+// PTE for 0xFEE00000 so we can flip its writable bit at runtime.
+#define APIC_PAGE_GPA  0xFEE00000ull
+#define NPT_PTE_RW     (1ull << 1)
+// SMP.3b AP-startup emulation (xAPIC MMIO trap -> swallow INIT/SIPI -> NMI-wake ->
+// real-mode reset into Windows' trampoline). It WORKS up to the point of getting
+// the AP to run Windows' AP-startup code, but under nested VMware the AP can't
+// complete Windows' AP-init cleanly (KERNEL_SECURITY_CHECK_FAILURE + monitor
+// panic). Left OFF by default so the APs start natively (a working multi-core
+// Windows, with the APs virtualized by the layer below us). Flip to 1 to enable
+// the emulator - most likely to succeed on BARE METAL, where x2APIC/AVIC and
+// non-nested SVM remove these limits.
+#define SMP_EMULATE_AP_STARTUP  0
+static UINT64 *g_apic_pte      = 0;
+static volatile UINT64 g_apic_faults = 0;
+static volatile UINT64 g_apic_rip    = 0;
+static volatile UINT64 g_apic_b0     = 0;
+static volatile UINT64 g_apic_b1     = 0;
+static volatile UINT64 g_apic_gpa    = 0;
+static volatile UINT64 g_apic_info1  = 0;
+// Increment 2: single-step machinery. We keep the APIC page trapped and step each
+// write through under TF for a bounded budget, then un-protect for speed.
+static UINT64  g_ss_budget = 100000;   // cap; we stop early once the SIPI is caught
+static BOOLEAN g_ss_active = FALSE;
+static UINT64  g_ss_if     = 0;   // guest IF saved across the single-step
+static volatile UINT64 g_db_count = 0;   // # completed single-steps (proof it works)
+// Increment 3: what we decode out of the ICR writes (the AP-startup IPIs).
+#define APIC_ICR_LO 0x300     // write here sends the IPI; bits8-10=mode, 0-7=vector
+#define APIC_ICR_HI 0x310     // destination (xAPIC ID in bits 24-31)
+static volatile UINT64 g_icr_lo = 0, g_icr_hi = 0;
+static volatile UINT64 g_icr_count = 0, g_init_cnt = 0, g_sipi_cnt = 0, g_sipi_vec = 0;
+static volatile UINT64 g_undec = 0;   // ICR writes we couldn't decode
+static UINT64 g_last_ipi_fault = 0;   // APIC-fault count at the last INIT/SIPI
+
+// Increment 4: cross-core SIPI signaling. The BSP and APs run from SEPARATE
+// relocated image copies, so they cannot share ordinary globals - instead they
+// share this page, allocated once at UEFI time with its address captured BEFORE
+// any relocation (so every copy holds the same physical pointer). Indexed by
+// APIC ID: the BSP writes the SIPI vector here; the parked AP polls for it.
+typedef struct {
+    volatile UINT32 sipi_vec[64];    // BSP -> AP: (vector | 0x100) means "start here"
+    volatile UINT32 ap_started[64];  // AP -> BSP: set when the AP runs its trampoline
+    volatile UINT64 last_bad_exit;   // AP diag: exit_code of the last unexpected exit
+    volatile UINT64 last_bad_rip;    // AP diag: guest RIP at that exit
+    volatile UINT64 bad_count;       // AP diag: how many unexpected exits total
+    volatile UINT64 rm_exit;         // AP diag: exit_code while the guest is real-mode
+    volatile UINT64 rm_rip;          // AP diag: guest RIP at that real-mode exit
+    volatile UINT32 init_loops[64];  // per-AP: times the wake (NMI) handler ran
+    volatile UINT32 nmi_sent[64];    // per-AP: BSP has already NMI-woken this core
+} smp_shared_t;
+static smp_shared_t *g_smp = 0;      // same physical page in every image copy
+
 // Read a few well-known fields out of KUSER_SHARED_DATA (a fixed kernel address
 // that every Windows maps) - proof the hypervisor can read the live OS's own
 // memory. NtSystemRoot ("C:\Windows") and the version live at stable offsets.
@@ -570,6 +670,179 @@ static void hv_vmi_windows(vmcb *v) {
     dbg_puts("[VMI] === we just read that out of Windows' own address space ===\r\n\r\n");
 }
 
+// ---- VMI: find a process by name ------------------------------------------
+//
+// This is the showcase: from BENEATH Windows, with no driver and no help from
+// the guest, we walk the kernel's own list of running processes and find one by
+// name. It's the same primitive an EDR/anti-cheat/forensics tool uses - except
+// we're doing it from the hypervisor.
+//
+// How: every EPROCESS (the kernel's process object) is threaded onto a circular
+// doubly-linked list via its ActiveProcessLinks field. We get a first EPROCESS
+// from the current thread (KPCR -> KPRCB.CurrentThread -> KTHREAD.Process), then
+// walk the ring, reading each process's ImageFileName and comparing to the name.
+//
+// These are the field offsets for 64-bit Windows 10/11 (19041+). They are
+// build-specific; if a future build moves them, the walk simply finds nothing
+// (every read is bounds-checked, so a wrong offset can't crash the host).
+//
+// NOTE: this reads *kernel* memory using the calling process's CR3. That works
+// because AMD CPUs aren't affected by Meltdown, so Windows leaves KPTI/KVA-shadow
+// OFF - the full kernel stays mapped in every process. (On an Intel host with
+// KPTI on, we'd instead need the kernel CR3.)
+#define OFF_KPCR_CURRENT_THREAD  0x188   // KPCR.Prcb(0x180).CurrentThread(0x08)
+#define OFF_KTHREAD_PROCESS      0x0B8   // KTHREAD.ApcState(0x98).Process(0x20)
+#define OFF_EPROC_UNIQUE_PID     0x440   // EPROCESS.UniqueProcessId
+#define OFF_EPROC_LINKS          0x448   // EPROCESS.ActiveProcessLinks (LIST_ENTRY)
+#define OFF_EPROC_IMAGENAME      0x5A8   // EPROCESS.ImageFileName (15 chars + NUL)
+
+// Case-insensitive compare of up to n bytes; stops at a NUL in either string.
+static BOOLEAN name_ieq(const char *a, const char *b, int n) {
+    for (int i = 0; i < n; i++) {
+        char ca = a[i], cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') ca += 32;
+        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        if (ca != cb) return FALSE;
+        if (ca == 0)  return TRUE;
+    }
+    return TRUE;
+}
+
+// Read a UINT64 out of guest kernel memory, or return 0 if not mapped.
+static UINT64 guest_rd64(vmcb *v, UINT64 gva) {
+    UINT64 *p = (UINT64 *)guest_va_to_host(v, gva);
+    return p ? *p : 0;
+}
+
+// Walk the active-process list and return the PID whose image name matches
+// `want` (e.g. "notepad.exe"), or 0 if none / offsets don't match this build.
+static UINT64 vmi_find_pid(vmcb *v, const char *want) {
+    // KernelGsBase holds the KPCR while the guest is in user mode (which it is
+    // when minictl issues its VMMCALL). From there: current thread -> process.
+    UINT64 kpcr = v->save.kernel_gs_base;
+    if (!kpcr) return 0;
+    UINT64 ethread = guest_rd64(v, kpcr + OFF_KPCR_CURRENT_THREAD);
+    if (!ethread) return 0;
+    UINT64 eproc = guest_rd64(v, ethread + OFF_KTHREAD_PROCESS);
+    if (!eproc) return 0;
+
+    UINT64 start = eproc;
+    for (int i = 0; i < 4096 && eproc; i++) {       // bounded: never loop forever
+        char *img = (char *)guest_va_to_host(v, eproc + OFF_EPROC_IMAGENAME);
+        if (img && name_ieq(img, want, 15))
+            return guest_rd64(v, eproc + OFF_EPROC_UNIQUE_PID);
+        // Follow ActiveProcessLinks.Flink to the next EPROCESS. The link points
+        // at the *middle* of the next EPROCESS, so subtract the field offset.
+        UINT64 flink = guest_rd64(v, eproc + OFF_EPROC_LINKS);
+        if (!flink) break;
+        eproc = flink - OFF_EPROC_LINKS;
+        if (eproc == start) break;                  // came full circle
+    }
+    return 0;
+}
+
+// Read guest general register `n` (0=RAX .. 15=R15) as 64-bit. RAX/RSP live in
+// the VMCB save area; the rest are in the saved GPR block (order per vmrun.asm).
+static UINT64 guest_reg(vmcb *v, guest_gprs *g, int n) {
+    switch (n) {
+        case 0:  return v->save.rax;   case 1:  return g->rcx;
+        case 2:  return g->rdx;        case 3:  return g->rbx;
+        case 4:  return v->save.rsp;   case 5:  return g->rbp;
+        case 6:  return g->rsi;        case 7:  return g->rdi;
+        case 8:  return g->r8;         case 9:  return g->r9;
+        case 10: return g->r10;        case 11: return g->r11;
+        case 12: return g->r12;        case 13: return g->r13;
+        case 14: return g->r14;        default: return g->r15;
+    }
+}
+
+// Best-effort decode of the 32-bit value a MOV-to-memory APIC store writes, and
+// its total byte length (so the caller can skip/"swallow" the instruction).
+// Windows' HAL uses `mov [reg+disp], r32` (opcode 0x89, value in the ModRM.reg
+// register - confirmed by increment 1) and sometimes `mov [mem], imm32` (0xC7).
+// Returns FALSE for any other form (caller counts it and passes through anyway).
+static BOOLEAN decode_apic_write(vmcb *v, guest_gprs *g, UINT32 *out, int *len) {
+    UINT8 *ip = (UINT8 *)guest_va_to_host(v, v->save.rip);
+    if (!ip) return FALSE;
+    int i = 0;
+    UINT8 rex = 0;
+    for (;;) {                                  // skip prefixes, keep REX
+        UINT8 b = ip[i];
+        if (b == 0x66 || b == 0x67 || b == 0xF0 || b == 0xF2 || b == 0xF3 ||
+            b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26 || b == 0x64 || b == 0x65) {
+            i++; continue;
+        }
+        if (b >= 0x40 && b <= 0x4F) { rex = b; i++; continue; }
+        break;
+    }
+    UINT8 op = ip[i++];
+    UINT8 modrm = ip[i++];
+    int mod = modrm >> 6, reg = (modrm >> 3) & 7, rm = modrm & 7;
+    if (op != 0x89 && op != 0xC7) return FALSE;
+    if (op == 0x89)                             // MOV r/m32, r32 -> value in reg
+        *out = (UINT32)guest_reg(v, g, reg | ((rex & 0x4) ? 8 : 0));   // + REX.R
+    // Walk past ModRM's SIB/displacement to find the instruction end.
+    if (mod != 3) {
+        if (rm == 4) i++;                                       // SIB byte
+        if (mod == 1) i += 1;                                   // disp8
+        else if (mod == 2) i += 4;                              // disp32
+        else if (mod == 0 && rm == 5) i += 4;                  // RIP-relative disp32
+    }
+    if (op == 0xC7) {                           // MOV r/m32, imm32 -> value = imm
+        *out = (UINT32)(ip[i] | (ip[i+1] << 8) | (ip[i+2] << 16) | ((UINT32)ip[i+3] << 24));
+        i += 4;
+    }
+    if (len) *len = i;
+    return TRUE;
+}
+
+// Send an NMI IPI to the given (physical, xAPIC) APIC ID via this core's local
+// APIC. The APIC MMIO region is UC by MTRR, so a plain write reaches it. Used to
+// wake a parked AP for startup without a (latching) INIT.
+static void send_nmi(UINT32 apicid) {
+    volatile UINT32 *icr_hi = (volatile UINT32 *)(APIC_PAGE_GPA + 0x310);
+    volatile UINT32 *icr_lo = (volatile UINT32 *)(APIC_PAGE_GPA + 0x300);
+    *icr_hi = apicid << 24;
+    *icr_lo = 0x00004400;    // delivery mode 4 (NMI), assert, edge, dest = ICR-high
+}
+
+// Increment 4: set an AP's guest VMCB to the state a real CPU has right after
+// receiving SIPI with the given `vector`: 16-bit real mode, CS = vector<<8 with
+// base vector<<12, everything else at INIT/reset defaults. VMRUN then runs
+// Windows' real-mode AP trampoline at that address as our guest, and it will
+// bring itself up to long mode and into the AP kernel entry - staying our guest.
+static void set_realmode_ap(vmcb *v, guest_gprs *g, UINT32 vector) {
+    v->save.cs.selector = (UINT16)(vector << 8);
+    v->save.cs.base     = (UINT64)vector << 12;
+    v->save.cs.limit    = 0xFFFF;
+    v->save.cs.attrib   = 0x009B;                 // 16-bit code, r/x, present
+    v->save.ss.selector = 0; v->save.ss.base = 0; v->save.ss.limit = 0xFFFF;
+    v->save.ss.attrib   = 0x0093;                 // 16-bit data, r/w, present
+    v->save.ds = v->save.es = v->save.fs = v->save.gs = v->save.ss;  // all base 0
+    v->save.gdtr.base = 0; v->save.gdtr.limit = 0xFFFF;
+    v->save.idtr.base = 0; v->save.idtr.limit = 0xFFFF;
+    v->save.ldtr.selector = 0; v->save.ldtr.base = 0; v->save.ldtr.limit = 0xFFFF;
+    v->save.ldtr.attrib = 0x0082;
+    v->save.tr.selector = 0; v->save.tr.base = 0; v->save.tr.limit = 0xFFFF;
+    v->save.tr.attrib = 0x008B;
+    v->save.cr0   = 0x60000010;                   // CD|NW|ET, PE=0, PG=0 (real mode)
+    v->save.cr2   = 0; v->save.cr3 = 0; v->save.cr4 = 0;
+    v->save.efer  = 0x1000;                        // SVME only (required for VMRUN)
+    v->save.rip   = 0;
+    v->save.rsp   = 0;
+    v->save.rflags = 0x2;
+    v->save.rax   = 0;
+    v->save.dr6   = 0xFFFF0FF0; v->save.dr7 = 0x400;
+    v->save.cpl   = 0;
+    v->save.g_pat = 0x0007040600070406ull;
+    // Reset the general-purpose registers (RDX = a plausible family/model, as a
+    // real CPU leaves it after reset; the rest zero).
+    g->rbx = g->rcx = 0; g->rdx = 0x600;
+    g->rsi = g->rdi = g->rbp = 0;
+    g->r8 = g->r9 = g->r10 = g->r11 = 0;
+    g->r12 = g->r13 = g->r14 = g->r15 = 0;
+}
+
 // hv_handle_exit is called (from vmrun.asm's resident loop) on every #VMEXIT
 // while self-virtualized. It stays off the firmware console (the guest owns it);
 // it only spoofs CPUID leaf 0 and passes everything else through by advancing
@@ -582,7 +855,20 @@ void hv_handle_exit(vmcb *v, guest_gprs *g) {
     static UINT64 exits = 0;
     static BOOLEAN kernel_seen = FALSE;
     exits++;
-    if (exits <= 32 || (exits & 0x1FFF) == 0)     // first 32, then every 8192
+    // Default: no TLB flush. A handler that changes an NPT permission sets
+    // tlb_control=1 to flush once on the next VMRUN; clearing it here means that
+    // flush happens exactly once instead of on every subsequent VMRUN.
+    v->control.tlb_control = 0;
+    // Diagnostic: capture what a real-mode guest (an AP running its trampoline)
+    // is exiting on. The BSP is always in long mode (PE=1), so this only tracks
+    // the APs.
+    if (g_smp && !(v->save.cr0 & 1)) {
+        g_smp->rm_exit = v->control.exit_code;
+        g_smp->rm_rip  = v->save.rip;
+    }
+    // Only log guest RIP for the long-mode BSP - a looping real-mode AP would
+    // otherwise flood the serial.
+    if ((v->save.cr0 & 1) && (exits <= 32 || (exits & 0x1FFF) == 0))
         dbg_hex("[hv] guest rip=", v->save.rip);
     // Milestone: the guest RIP entering the high canonical half means the
     // Windows KERNEL (ntoskrnl) is now executing as our guest. At that point we
@@ -614,12 +900,29 @@ void hv_handle_exit(vmcb *v, guest_gprs *g) {
             }
             if (vmi_done) {
                 dbg_puts("[hv] disabling CPUID intercept -> guest now runs at native speed.\r\n");
-                v->control.intercept_vec3 = 0;
+                // Clear ONLY CPUID - keep any other vec3 intercepts (e.g. the
+                // MSR intercept we use to watch AP startup) active.
+                v->control.intercept_vec3 &= ~INTERCEPT_CPUID;
             }
         }
     }
 
     UINT64 code = v->control.exit_code;
+
+    if (code == VMEXIT_DB) {
+        // End of a single-step (increment 2): the APIC write we allowed has now
+        // executed (RIP already points past it). Re-protect the APIC page, drop
+        // the #DB intercept, and restore the guest's trap/interrupt flags.
+        if (g_ss_active) {
+            g_ss_active = FALSE;
+            g_db_count++;
+            if (g_apic_pte) *g_apic_pte &= ~NPT_PTE_RW;
+            v->control.tlb_control = 1;
+            v->control.intercept_exceptions &= ~EXC_DB;
+            v->save.rflags = (v->save.rflags & ~RFLAGS_TF) | g_ss_if;
+        }
+        return;
+    }
 
     if (code == VMEXIT_CPUID) {
         // Transparent to the guest OS: pass real values through, but (a) set the
@@ -654,30 +957,229 @@ void hv_handle_exit(vmcb *v, guest_gprs *g) {
         // Guest tools channel: RAX == HV_MAGIC means a program inside the guest
         // (e.g. minictl.exe) is calling us. The command is in RCX; we answer in
         // RAX. Works from any privilege level, since VMMCALL traps to us.
+        //
+        // DIAGNOSTIC: log the first handful of VMMCALLs we see (guest RAX/RCX),
+        // so if minictl's hypercall misbehaves we can tell whether it even
+        // reaches us and with what register values. Windows never issues
+        // VMMCALL, so this only fires for our own tool.
+        {
+            static UINT64 vmc = 0;
+            if (vmc < 24) {
+                vmc++;
+                if (vmc == 1)
+                    // Live APIC mode on this core: bit 11 = APIC enabled,
+                    // bit 10 = x2APIC enabled. Tells us definitively whether
+                    // Windows switched to x2APIC (so our 0x830 intercept can fire)
+                    // or is still on legacy xAPIC (MMIO).
+                    dbg_hex("[hv] IA32_APIC_BASE (bit10=x2apic,bit11=en)=",
+                            __readmsr(0x1Bu));
+                dbg_hex("[hv] VMMCALL guest rax=", v->save.rax);
+                dbg_hex("[hv]         guest rcx=", g->rcx);
+            }
+        }
         if (v->save.rax == HV_MAGIC) {
             switch (g->rcx) {
                 case HVC_PING:    v->save.rax = HV_REPLY;      break;
                 case HVC_EXITS:   v->save.rax = exits;         break;
                 case HVC_WINVER:  v->save.rax = g_win_major;   break;
                 case HVC_VERSION: v->save.rax = 0x00010000;    break;  // v1.0
+                case HVC_APICBASE:  v->save.rax = __readmsr(0x1Bu); break;
+                case HVC_SMP_COUNT: v->save.rax = g_ipi_seen;       break;
+                case HVC_SMP_SIPI:  v->save.rax = g_last_sipi;      break;
+                case HVC_APIC_FAULTS: v->save.rax = g_apic_faults;  break;
+                case HVC_APIC_RIP:    v->save.rax = g_apic_rip;     break;
+                case HVC_APIC_B0:     v->save.rax = g_apic_b0;      break;
+                case HVC_APIC_B1:     v->save.rax = g_apic_b1;      break;
+                case HVC_APIC_GPA:    v->save.rax = g_apic_gpa;     break;
+                case HVC_APIC_INFO1:  v->save.rax = g_apic_info1;   break;
+                case HVC_DB_COUNT:    v->save.rax = g_db_count;     break;
+                case HVC_ICR_LO:      v->save.rax = g_icr_lo;       break;
+                case HVC_ICR_HI:      v->save.rax = g_icr_hi;       break;
+                case HVC_ICR_COUNT:   v->save.rax = g_icr_count;    break;
+                case HVC_INIT_CNT:    v->save.rax = g_init_cnt;     break;
+                case HVC_SIPI_CNT:    v->save.rax = g_sipi_cnt;     break;
+                case HVC_SIPI_VEC:    v->save.rax = g_sipi_vec;     break;
+                case HVC_APIC_UNDEC:  v->save.rax = g_undec;        break;
+                case HVC_AP_STARTED: {
+                    UINT64 n = 0;
+                    if (g_smp) for (int k = 0; k < 64; k++) if (g_smp->ap_started[k]) n++;
+                    v->save.rax = n;
+                    break;
+                }
+                case HVC_AP_BADEXIT:  v->save.rax = g_smp ? g_smp->last_bad_exit : 0; break;
+                case HVC_AP_BADRIP:   v->save.rax = g_smp ? g_smp->last_bad_rip  : 0; break;
+                case HVC_AP_BADCOUNT: v->save.rax = g_smp ? g_smp->bad_count     : 0; break;
+                case HVC_RM_EXIT:     v->save.rax = g_smp ? g_smp->rm_exit : 0; break;
+                case HVC_RM_RIP:      v->save.rax = g_smp ? g_smp->rm_rip  : 0; break;
+                case HVC_INIT_LOOPS: {
+                    UINT64 mx = 0;
+                    if (g_smp) for (int k = 0; k < 64; k++)
+                        if (g_smp->init_loops[k] > mx) mx = g_smp->init_loops[k];
+                    v->save.rax = mx;
+                    break;
+                }
+                case HVC_FIND_PID: {
+                    // RDX = guest pointer to a NUL-terminated process name.
+                    // Copy it into a small local buffer, then walk the kernel's
+                    // process list for it and return the PID (0 = not found).
+                    char want[16]; int k = 0;
+                    char *nm = (char *)guest_va_to_host(v, g->rdx);
+                    if (nm) while (k < 15 && nm[k]) { want[k] = nm[k]; k++; }
+                    want[k] = 0;
+                    v->save.rax = nm ? vmi_find_pid(v, want) : 0;
+                    break;
+                }
                 default:          v->save.rax = 0;             break;
             }
+            dbg_hex("[hv]         -> reply rax=", v->save.rax);
         }
         v->save.rip = v->control.nrip ? v->control.nrip
                                       : v->save.rip + VMMCALL_LEN;
         return;
     }
 
-    if (code == VMEXIT_INIT) {
-        // The OS just sent INIT to this core to bring it online as an AP. We do
-        // not yet emulate the reset-to-real-mode-at-SIPI-vector (that's SMP.3b),
-        // so log it and park the core. On real multi-core Windows this tells us
-        // exactly when and on which core the OS starts an AP.
-        static volatile UINT64 init_seen = 0;
-        if (++init_seen <= 8)
-            dbg_hex("[SMP] INIT #VMEXIT - OS is starting an AP; asid=",
-                    v->control.guest_asid);
-        for (;;) __halt();
+    if (code == VMEXIT_MSR) {
+        // We only intercept WRITES to the x2APIC ICR (0x830). Decode the IPI and
+        // log INIT/SIPI (SMP.3b step 1: observe-only), then forward the write so
+        // AP startup is unchanged for now. Other MSR accesses shouldn't reach
+        // here (nothing else is set in the MSRPM), but we pass them through to be
+        // safe rather than swallow them.
+        UINT32  msr   = (UINT32)g->rcx;
+        BOOLEAN write = (v->control.exit_info1 & 1) != 0;
+        UINT64  val   = ((UINT64)(UINT32)g->rdx << 32) | (UINT32)v->save.rax;
+        if (write && msr == MSR_X2APIC_ICR) {
+            UINT32 dm = (UINT32)((val >> 8) & 7);           // delivery mode
+            if (dm == 5 || dm == 6) {                       // INIT / SIPI
+                g_ipi_seen++;                               // read back via hypercall
+                if (dm == 6) g_last_sipi = val;             // SIPI carries the vector
+                dbg_puts(dm == 5 ? "[SMP] BSP -> INIT  " : "[SMP] BSP -> SIPI  ");
+                dbg_hex("x2apic dest=", val >> 32);
+                dbg_hex("           ICR=", val);
+                // Once AP startup is done, stop trapping the ICR - otherwise
+                // every TLB-shootdown / scheduler IPI would keep trapping and
+                // crawl the system. (~3 IPIs per AP started.)
+                if (g_ipi_seen >= 24) {
+                    v->control.intercept_vec3 &= ~INTERCEPT_MSR;
+                    dbg_puts("[SMP] AP startup observed; ICR intercept off.\r\n");
+                }
+            }
+            __writemsr(MSR_X2APIC_ICR, val);                // forward unchanged
+        } else if (write) {
+            __writemsr(msr, val);
+        } else {
+            UINT64 r = __readmsr(msr);
+            v->save.rax = (UINT32)r;
+            g->rdx      = (UINT32)(r >> 32);
+        }
+        v->save.rip = v->control.nrip ? v->control.nrip : v->save.rip + 2;
+        return;
+    }
+
+    if (code == VMEXIT_NMI) {
+        // Increment 7: the BSP woke this parked AP with an NMI (instead of a
+        // latching INIT) because the OS wants to start it. Read our published
+        // trampoline vector and reset the guest into real mode there, so it runs
+        // Windows' AP-startup code as our guest. NMI is edge-triggered, so this
+        // fires exactly once - and we then drop the NMI intercept so any later
+        // (genuine) NMIs go to Windows normally.
+        int r[4];
+        __cpuidex(r, 1, 0);
+        UINT32 apicid = (UINT32)((r[1] >> 24) & 0x3F);   // CPUID.1:EBX[31:24]
+        if (g_smp && apicid < 64) g_smp->init_loops[apicid]++;
+        if (g_smp && apicid < 64 && (g_smp->sipi_vec[apicid] & 0x100)) {
+            UINT32 vector = g_smp->sipi_vec[apicid] & 0xFF;
+            set_realmode_ap(v, g, vector);                // reset guest -> real mode
+            v->control.tlb_control = 1;                    // flush stale translations
+            v->control.intercept_vec3 &= ~INTERCEPT_NMI;  // one-shot: stop trapping NMI
+            g_smp->ap_started[apicid] = 1;                // observable via hypercall
+            return;                                       // VMRUN runs the trampoline
+        }
+        // A stray NMI with no pending start - just resume.
+        v->control.intercept_vec3 &= ~INTERCEPT_NMI;
+        return;
+    }
+
+    if (code == VMEXIT_NPF && (v->control.exit_info2 & ~0xFFFull) == APIC_PAGE_GPA) {
+        // SMP.3b increment 1: the guest wrote the local-APIC MMIO page (which we
+        // write-protected). Snapshot the FIRST such access - the faulting GPA
+        // (its low 12 bits are the APIC register offset), the guest RIP, and the
+        // instruction bytes - so we can design the write decoder. Then un-protect
+        // the page and re-run the instruction so Windows carries on normally.
+        if (g_apic_faults == 0) {
+            g_apic_gpa   = v->control.exit_info2;
+            g_apic_rip   = v->save.rip;
+            g_apic_info1 = v->control.exit_info1;
+            UINT8 *ip = (UINT8 *)guest_va_to_host(v, v->save.rip);
+            if (ip) {
+                UINT64 b0 = 0, b1 = 0;
+                for (int i = 0; i < 8; i++) b0 |= (UINT64)ip[i]     << (i * 8);
+                for (int i = 0; i < 8; i++) b1 |= (UINT64)ip[i + 8] << (i * 8);
+                g_apic_b0 = b0;
+                g_apic_b1 = b1;
+            }
+        }
+        g_apic_faults++;
+
+        // Increment 3: capture the ICR writes (the AP-startup IPIs). 0x310 holds
+        // the destination; 0x300 sends it with delivery mode in bits 8-10
+        // (5=INIT, 6=SIPI) and, for SIPI, the trampoline vector in bits 0-7.
+        UINT32 off = (UINT32)(v->control.exit_info2 & 0xFFF);
+        if (off == APIC_ICR_LO || off == APIC_ICR_HI) {
+            UINT32 val = 0; int ilen = 0;
+            if (decode_apic_write(v, g, &val, &ilen)) {
+                if (off == APIC_ICR_HI) g_icr_hi = val;
+                else {
+                    g_icr_lo = val; g_icr_count++;
+                    UINT32 dm = (val >> 8) & 7;
+                    if (dm == 5) { g_init_cnt++; g_last_ipi_fault = g_apic_faults; }
+                    if (dm == 6) {
+                        g_sipi_cnt++; g_sipi_vec = val & 0xFF;
+                        g_last_ipi_fault = g_apic_faults;
+                        // Publish the trampoline vector for every AP (all identical).
+                        if (g_smp)
+                            for (int k = 0; k < 64; k++)
+                                g_smp->sipi_vec[k] = (val & 0xFF) | 0x100;
+                    }
+                    // Increment 7: SWALLOW INIT (5) and SIPI (6) - do NOT let the
+                    // physical IPI reach the AP (an intercepted INIT would latch
+                    // and loop). Instead, skip the instruction, and for the SIPI
+                    // wake the target AP with an NMI (edge-triggered, no latch);
+                    // its NMI handler resets it into the trampoline as our guest.
+                    if (dm == 5 || dm == 6) {
+                        if (dm == 6) {
+                            UINT32 dest = (UINT32)((g_icr_hi >> 24) & 0x3F);
+                            // Exactly one NMI per AP (the OS sends SIPI twice).
+                            if (g_smp && dest < 64 && !g_smp->nmi_sent[dest]) {
+                                g_smp->nmi_sent[dest] = 1;
+                                send_nmi(dest);
+                            }
+                        }
+                        v->save.rip += ilen;         // swallow (skip the write)
+                        return;
+                    }
+                }
+            } else {
+                g_undec++;
+            }
+        }
+
+        // Stop trapping once the AP-startup burst is over (no new IPI for a while)
+        // or the safety budget runs out - so Windows returns to full speed. The
+        // burst stays trapped so we swallow+NMI every AP's INIT/SIPI.
+        if ((g_sipi_cnt >= 1 && g_apic_faults - g_last_ipi_fault > 3000) ||
+            g_ss_budget == 0) {
+            if (g_apic_pte) *g_apic_pte |= NPT_PTE_RW;   // done: let Windows run free
+            v->control.tlb_control = 1;
+            return;
+        }
+        g_ss_budget--;
+        g_ss_active = TRUE;
+        if (g_apic_pte) *g_apic_pte |= NPT_PTE_RW;       // allow the faulting write
+        v->control.tlb_control = 1;                      // flush stale RO mapping
+        v->control.intercept_exceptions |= EXC_DB;       // trap after one instruction
+        g_ss_if = v->save.rflags & RFLAGS_IF;            // run it with interrupts off
+        v->save.rflags = (v->save.rflags & ~RFLAGS_IF) | RFLAGS_TF;
+        return;                                           // re-run the write under TF
     }
 
     if (code == VMEXIT_NPF) {
@@ -704,7 +1206,14 @@ void hv_handle_exit(vmcb *v, guest_gprs *g) {
         return;   // resume the faulting instruction
     }
 
-    // Truly unexpected exit: report via serial and stop.
+    // Truly unexpected exit: report via serial (dead post-boot) AND record it in
+    // the shared page so an AP that dies after its real-mode reset is visible to
+    // minictl on the BSP (e.g. a rejected real-mode VMCB shows exit_code == ~0).
+    if (g_smp) {
+        g_smp->last_bad_exit = code;
+        g_smp->last_bad_rip  = v->save.rip;
+        g_smp->bad_count++;
+    }
     dbg_puts("\r\n[hv] unexpected #VMEXIT while resident - stopping:\r\n");
     dbg_hex("     exit_code  : ", code);
     dbg_hex("     exit_info1 : ", v->control.exit_info1);
@@ -804,11 +1313,34 @@ void svm_go_resident(EFI_HANDLE image, EFI_BOOT_SERVICES *bs) {
     v->control.intercept_vec3 = INTERCEPT_CPUID;
     v->control.intercept_vec4 = INTERCEPT_VMRUN | INTERCEPT_VMMCALL;
 
+    // SMP.3b step 1 (observe-only): intercept writes to the x2APIC ICR so we can
+    // see the BSP start the APs via INIT/SIPI. The MSR permission map is 8 KiB;
+    // an all-zero map intercepts nothing, so we set just the write-intercept bit
+    // for MSR 0x830. We LOG INIT/SIPI and forward the write unchanged for now -
+    // this confirms whether the OS uses x2APIC (MSR) or legacy xAPIC (MMIO).
+    UINT64 msrpm = 0;
+    if (!EFI_ERROR(bs->AllocatePages(AllocateAnyPages, EfiRuntimeServicesData, 2, &msrpm)) && msrpm) {
+        UINT8 *m = (UINT8 *)msrpm;
+        for (UINTN k = 0; k < 2 * 4096; k++) m[k] = 0;   // 0 = allow (no intercept)
+        m[MSR_X2APIC_ICR / 4] |= (UINT8)(1u << ((MSR_X2APIC_ICR % 4) * 2 + 1));
+        v->control.msrpm_base_pa   = msrpm;
+        v->control.intercept_vec3 |= INTERCEPT_MSR;
+    }
+
     UINT64 npt = npt_build(bs, 0, 0);          // identity NPT: guest sees all RAM
     if (!npt) return;
     v->control.np_enable = 1;
     v->control.n_cr3     = npt;
     v->save.g_pat        = 0x0007040600070406ull;
+
+    // SMP.3b increment 1: write-protect the local-APIC MMIO page in the NPT so we
+    // trap the guest's APIC register writes (including the ICR that starts the
+    // APs). We only need to see the FIRST one to learn the instruction form, then
+    // the #NPF handler un-protects and lets Windows continue.
+    if (SMP_EMULATE_AP_STARTUP) {
+        g_apic_pte = npt_pte_ptr(bs, npt, APIC_PAGE_GPA);
+        if (g_apic_pte) *g_apic_pte &= ~NPT_PTE_RW;  // read-only -> writes fault
+    }
 
     UINT64 hostpt = hostpt_build(bs);          // M10.1: host's own page tables
     if (!hostpt) return;
@@ -855,6 +1387,16 @@ BOOLEAN svm_relocate_aps(EFI_HANDLE image, EFI_BOOT_SERVICES *bs) {
     return relocate_hv_image(image, bs, &g_ap_delta);
 }
 
+// BSP: allocate the page the BSP and APs use to hand off SIPI vectors. MUST be
+// called BEFORE any relocate (svm_relocate_aps / svm_go_resident) so that every
+// relocated image copy captures the same g_smp pointer. Persistent memory.
+BOOLEAN svm_smp_shared_init(EFI_BOOT_SERVICES *bs) {
+    UINT64 p = alloc_page(bs);                 // zeroed EfiRuntimeServicesData page
+    if (!p) return FALSE;
+    g_smp = (smp_shared_t *)p;
+    return TRUE;
+}
+
 // BSP: build the NPT + host page tables shared by every AP (identity, so one
 // copy is fine for all of them). Call once before starting the APs.
 BOOLEAN svm_build_ap_tables(EFI_BOOT_SERVICES *bs) {
@@ -890,11 +1432,14 @@ void svm_virtualize_ap(int i) {
     vmcb *v = (vmcb *)s->guest_vmcb;
     fill_current_cpu_state(v);
     v->control.guest_asid     = (UINT32)(i + 1);
-    // Do NOT intercept INIT: let the hardware deliver it to the AP guest so the
-    // core resets itself into Windows' real-mode AP-startup trampoline (running
-    // as our guest). If that doesn't work we'll intercept + emulate the reset.
-    v->control.intercept_vec3 = 0;
-    v->control.intercept_vec4 = INTERCEPT_VMRUN;
+    // With AP-startup emulation ON, intercept NMI (our wake signal). With it OFF
+    // (the default), intercept nothing here so the OS's native INIT/SIPI brings
+    // this core up normally (virtualized by the layer beneath us) - a stable
+    // multi-core Windows.
+    v->control.intercept_vec3 = SMP_EMULATE_AP_STARTUP ? INTERCEPT_NMI : 0;
+    // Intercept VMMCALL too, so the guest hypercall tool (minictl) works no
+    // matter which core it runs on - and it proves each AP is a real guest.
+    v->control.intercept_vec4 = INTERCEPT_VMRUN | INTERCEPT_VMMCALL;
     v->control.np_enable      = 1;
     v->control.n_cr3          = g_ap_npt;
     v->save.g_pat             = 0x0007040600070406ull;

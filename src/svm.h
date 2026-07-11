@@ -48,5 +48,7 @@ void svm_go_resident(EFI_HANDLE image, EFI_BOOT_SERVICES *bs);
 // virtualize itself (running its resident loop from the relocated copy).
 BOOLEAN svm_relocate_aps(EFI_HANDLE image, EFI_BOOT_SERVICES *bs);
 BOOLEAN svm_build_ap_tables(EFI_BOOT_SERVICES *bs);
+// Allocate the shared BSP<->AP SIPI-handoff page. Call BEFORE svm_relocate_aps.
+BOOLEAN svm_smp_shared_init(EFI_BOOT_SERVICES *bs);
 BOOLEAN svm_alloc_ap(EFI_BOOT_SERVICES *bs, int i);
 void    svm_virtualize_ap(int i);

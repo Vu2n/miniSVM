@@ -164,6 +164,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     // before anything else. If you see this line in PuTTY / the serial log,
     // capture is good; if not, the VM's serial-port config is the problem.
     serial_puts("\r\n[miniSVM] ===== COM1 serial is alive; hypervisor loading =====\r\n");
+    // Build tag: bump this string on every rebuild so a stale ISO is obvious -
+    // if this exact line isn't in the serial log, you booted an old ISO.
+    serial_puts("[miniSVM] BUILD TAG: SMP3B-mmio-8 (AP emulation gated OFF; native APs)\r\n");
 
     // Re-entry: if the boot manager re-launches us after we already went
     // resident, don't set the hypervisor up again - just hand control back so
@@ -238,7 +241,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             print_line(L"[M12] logical processors : ", total);
             if (total > 1) {
                 EFI_BOOT_SERVICES *bs = SystemTable->BootServices;
-                BOOLEAN ok = svm_relocate_aps(ImageHandle, bs) &&
+                // Allocate the shared SIPI-handoff page BEFORE relocating, so both
+                // the AP and BSP image copies capture the same pointer.
+                BOOLEAN ok = svm_smp_shared_init(bs) &&
+                             svm_relocate_aps(ImageHandle, bs) &&
                              svm_build_ap_tables(bs);
                 for (UINTN i = 1; i < total && i < 64 && ok; i++)
                     ok = svm_alloc_ap(bs, (int)i);

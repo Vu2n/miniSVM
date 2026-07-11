@@ -85,6 +85,33 @@ UINT64 npt_build(EFI_BOOT_SERVICES *bs, UINT64 redirect_gpa, UINT64 redirect_hpa
     return pml4_pa;
 }
 
+UINT64 *npt_pte_ptr(EFI_BOOT_SERVICES *bs, UINT64 pml4_pa, UINT64 gpa) {
+    UINT64 *pml4 = (UINT64 *)pml4_pa;
+    UINT64 e = pml4[(gpa >> 39) & 0x1FF];
+    if (!(e & PTE_P)) return 0;
+    UINT64 *pdpt = (UINT64 *)(e & ADDR_MASK);
+    e = pdpt[(gpa >> 30) & 0x1FF];
+    if (!(e & PTE_P) || (e & PTE_PS)) return 0;      // expect a 2 MiB-leaf PD below
+    UINT64 *pd = (UINT64 *)(e & ADDR_MASK);
+    UINT64 pdi = (gpa >> 21) & 0x1FF;
+    e = pd[pdi];
+    if (!(e & PTE_P)) return 0;
+    if (e & PTE_PS) {
+        // Split this 2 MiB leaf into 512 identity 4 KiB pages so we can control
+        // permissions on one of them.
+        UINT64 pt_pa = np_alloc(bs);
+        if (!pt_pa) return 0;
+        UINT64 *pt = (UINT64 *)pt_pa;
+        UINT64 region = gpa & ~0x1FFFFFull;           // 2 MiB base
+        for (UINT64 k = 0; k < 512; k++)
+            pt[k] = ((region | (k << 12)) & ADDR_MASK) | FLAGS_LEAF;
+        pd[pdi] = pt_pa | FLAGS_TABLE;
+        e = pd[pdi];
+    }
+    UINT64 *pt = (UINT64 *)(e & ADDR_MASK);
+    return &pt[(gpa >> 12) & 0x1FF];
+}
+
 UINT64 hostpt_build(EFI_BOOT_SERVICES *bs) {
     // Same shape as npt_build's identity map, but SUPERVISOR pages (no PTE_US).
     // The hypervisor runs at CPL0 and never touches user pages, so US=0 also
