@@ -139,6 +139,7 @@ extern UINT64 hv_resident(UINT64 guest_vmcb_pa, UINT64 host_vmcb_pa,
 #define INTERCEPT_CPUID   (1u << 18)  // vector 3: intercept the CPUID instruction
 #define INTERCEPT_VMRUN   (1u << 0)   // vector 4: required for VMRUN to be legal
 #define INTERCEPT_VMMCALL (1u << 1)   // vector 4: intercept VMMCALL
+#define VMEXIT_INIT       0x063ull     // INIT signal (OS starting this core)
 #define VMEXIT_CPUID      0x072ull
 #define VMEXIT_VMMCALL    0x081ull
 #define VMEXIT_NPF        0x400ull     // nested page fault (guest-physical)
@@ -667,6 +668,18 @@ void hv_handle_exit(vmcb *v, guest_gprs *g) {
         return;
     }
 
+    if (code == VMEXIT_INIT) {
+        // The OS just sent INIT to this core to bring it online as an AP. We do
+        // not yet emulate the reset-to-real-mode-at-SIPI-vector (that's SMP.3b),
+        // so log it and park the core. On real multi-core Windows this tells us
+        // exactly when and on which core the OS starts an AP.
+        static volatile UINT64 init_seen = 0;
+        if (++init_seen <= 8)
+            dbg_hex("[SMP] INIT #VMEXIT - OS is starting an AP; asid=",
+                    v->control.guest_asid);
+        for (;;) __halt();
+    }
+
     if (code == VMEXIT_NPF) {
         // An unexpected NPF. With a correct, persistent, identity NPT these
         // should not happen for mapped RAM - but if one does, log a few and
@@ -826,12 +839,21 @@ void svm_go_resident(EFI_HANDLE image, EFI_BOOT_SERVICES *bs) {
 // shared identity NPT and host page table. On the AP, svm_virtualize_ap()
 // self-virtualizes that core exactly like svm_go_resident does for the BSP.
 #define MAX_CPUS 64
+#define INTERCEPT_INIT (1u << 3)   // vector-3 bit: intercept INIT (AP startup)
 typedef struct {
     UINT64 guest_vmcb, host_vmcb, host_stack_top, hsave;
     guest_gprs gctx;
 } ap_state_t;
-static ap_state_t g_ap[MAX_CPUS];
+static ap_state_t *g_ap[MAX_CPUS];              // per-core state (persistent heap)
 static UINT64 g_ap_npt = 0, g_ap_hostpt = 0;
+static UINT64 g_ap_delta = 0;                   // relocation delta for AP loops
+
+// BSP: relocate a persistent copy of the hypervisor for the APs to run their
+// resident loops from (so they survive the OS's ExitBootServices). Separate copy
+// from the BSP's, so the two don't share the per-copy exit-handler statics.
+BOOLEAN svm_relocate_aps(EFI_HANDLE image, EFI_BOOT_SERVICES *bs) {
+    return relocate_hv_image(image, bs, &g_ap_delta);
+}
 
 // BSP: build the NPT + host page tables shared by every AP (identity, so one
 // copy is fine for all of them). Call once before starting the APs.
@@ -841,10 +863,12 @@ BOOLEAN svm_build_ap_tables(EFI_BOOT_SERVICES *bs) {
     return g_ap_npt && g_ap_hostpt;
 }
 
-// BSP: pre-allocate the per-core memory for AP slot `i` (1..N-1).
+// BSP: pre-allocate the per-core state for AP slot `i` (1..N-1), in persistent
+// memory (APs can't call boot services, and it must survive ExitBootServices).
 BOOLEAN svm_alloc_ap(EFI_BOOT_SERVICES *bs, int i) {
     if (i <= 0 || i >= MAX_CPUS) return FALSE;
-    ap_state_t *s = &g_ap[i];
+    ap_state_t *s = (ap_state_t *)alloc_page(bs);   // struct itself, persistent
+    if (!s) return FALSE;
     s->guest_vmcb = alloc_page(bs);
     s->host_vmcb  = alloc_page(bs);
     s->hsave      = alloc_page(bs);
@@ -852,24 +876,30 @@ BOOLEAN svm_alloc_ap(EFI_BOOT_SERVICES *bs, int i) {
     if (EFI_ERROR(bs->AllocatePages(AllocateAnyPages, EfiRuntimeServicesData, 8, &stk)))
         return FALSE;
     s->host_stack_top = stk + 8 * 4096;
+    g_ap[i] = s;
     return s->guest_vmcb && s->host_vmcb && s->hsave;
 }
 
-// AP: virtualize THIS core using pre-allocated slot `i`. Minimal intercepts
-// (only the mandatory VMRUN) so a parked AP produces essentially no exits.
-// Self-virtualizes and "returns" already running as a guest.
+// AP: virtualize THIS core using pre-allocated slot `i`. We intercept INIT (so
+// we see the OS starting this core) plus the mandatory VMRUN. The resident loop
+// is entered via the RELOCATED copy so it survives ExitBootServices.
 void svm_virtualize_ap(int i) {
-    ap_state_t *s = &g_ap[i];
+    ap_state_t *s = g_ap[i];
     __writemsr(MSR_VM_HSAVE_PA, s->hsave);
 
     vmcb *v = (vmcb *)s->guest_vmcb;
     fill_current_cpu_state(v);
     v->control.guest_asid     = (UINT32)(i + 1);
-    v->control.intercept_vec4 = INTERCEPT_VMRUN;   // mandatory only
+    // Do NOT intercept INIT: let the hardware deliver it to the AP guest so the
+    // core resets itself into Windows' real-mode AP-startup trampoline (running
+    // as our guest). If that doesn't work we'll intercept + emulate the reset.
+    v->control.intercept_vec3 = 0;
+    v->control.intercept_vec4 = INTERCEPT_VMRUN;
     v->control.np_enable      = 1;
     v->control.n_cr3          = g_ap_npt;
     v->save.g_pat             = 0x0007040600070406ull;
 
     __writecr3(g_ap_hostpt);                       // host runs on shared tables
-    hv_resident(s->guest_vmcb, s->host_vmcb, &s->gctx, s->host_stack_top);
+    hv_resident_fn fn = (hv_resident_fn)((UINT64)&hv_resident + g_ap_delta);
+    fn(s->guest_vmcb, s->host_vmcb, &s->gctx, s->host_stack_top);
 }

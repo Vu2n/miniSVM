@@ -7,7 +7,7 @@ It boots as a UEFI application, enters **AMD-V (SVM)**, virtualizes its *own*
 running code, survives the OS handoff, and then **boots a real, unmodified
 Windows install as its guest — all the way to the desktop — on physical
 hardware.** Along the way it reads live kernel memory out of the running OS and
-traps writes to protected pages.
+reads live kernel memory out of it. And it does all of this across every CPU core.
 
 No EDK2, no gnu-efi, no hypervisor framework. Just **MSVC + NASM + Python +
 xorriso**, and about a dozen small, readable source files. It's built as a
@@ -94,7 +94,7 @@ tutorial.
 | M9 | **Self-virtualization** | virtualizing your own execution |
 | M10 | Persist + own page tables + survive `ExitBootServices` | staying resident |
 | M11 | **Chainload Windows as a guest** | hosting a real OS |
-| M12 | **SMP** — virtualize every core (MP Services + per-core self-virt) | multi-core |
+| M12 | **SMP** — virtualize every core; boots **multi-core** Windows | MP Services, per-core self-virt, INIT/SIPI |
 | + | VMI + guest hypercall channel | introspection & guest tools |
 
 ---
@@ -142,7 +142,7 @@ powershell -ExecutionPolicy Bypass -File make-iso.ps1
 ### Booting Windows under it (real AMD hardware)
 
 1. A VMware Workstation VM with **UEFI firmware**, **Virtualize AMD-V/RVI** on,
-   and **1 vCPU** (SMP isn't implemented yet).
+   and 1 *or more* vCPUs — miniSVM virtualizes every core.
 2. Inside Windows, disable its own hypervisor so it doesn't fight for AMD-V:
    turn off *Memory Integrity*, *Hyper-V*, *Virtual Machine Platform*, and
    `bcdedit /set hypervisorlaunchtype off`.
@@ -159,7 +159,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a deeper tour.
 src/efi.h        minimal, self-contained UEFI definitions (no SDK)
 src/cpu.h        CPU intrinsics (CPUID, MSR, CR, port I/O)
 src/console.c/.h UEFI console + raw COM1/COM2 serial logging
-src/svm.c/.h     the hypervisor: detect, enable, VMCB, exit handler, VMI, memprot
+src/svm.c/.h     the hypervisor: detect, enable, VMCB, exit handler, VMI, SMP
 src/npt.c/.h     nested + host page-table builders
 src/vmrun.asm    VMRUN world-switch, self-virt resident loop, host-state capture
 src/main.c       entry point, milestone orchestration, chainload
@@ -171,7 +171,8 @@ build.ps1 / test.ps1 / make-iso.ps1   build & test
 
 ## Status & caveats
 
-- Single vCPU only (SMP / multi-core is the next milestone).
+- Multi-core supported (M12); tested up to 2 vCPUs — more should work but
+  hasn't been exercised.
 - Identity-maps 16 GiB of guest-physical space (fine for typical VM RAM).
 - Transparent, non-stealth, non-persistent-across-reboot — by design.
 

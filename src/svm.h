@@ -43,8 +43,10 @@ svm_result svm_run(EFI_BOOT_SERVICES *bs);
 void svm_go_resident(EFI_HANDLE image, EFI_BOOT_SERVICES *bs);
 
 // ---- M12: SMP (virtualize the other cores) --------------------------------
-// BSP calls svm_build_ap_tables + svm_alloc_ap (per core) before starting APs.
-// Each AP then calls svm_virtualize_ap(i) to self-virtualize itself.
+// BSP calls svm_relocate_aps + svm_build_ap_tables + svm_alloc_ap (per core)
+// before starting APs. Each AP then calls svm_virtualize_ap(i) to self-
+// virtualize itself (running its resident loop from the relocated copy).
+BOOLEAN svm_relocate_aps(EFI_HANDLE image, EFI_BOOT_SERVICES *bs);
 BOOLEAN svm_build_ap_tables(EFI_BOOT_SERVICES *bs);
 BOOLEAN svm_alloc_ap(EFI_BOOT_SERVICES *bs, int i);
 void    svm_virtualize_ap(int i);

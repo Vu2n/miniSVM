@@ -238,7 +238,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             print_line(L"[M12] logical processors : ", total);
             if (total > 1) {
                 EFI_BOOT_SERVICES *bs = SystemTable->BootServices;
-                BOOLEAN ok = svm_build_ap_tables(bs);
+                BOOLEAN ok = svm_relocate_aps(ImageHandle, bs) &&
+                             svm_build_ap_tables(bs);
                 for (UINTN i = 1; i < total && i < 64 && ok; i++)
                     ok = svm_alloc_ap(bs, (int)i);
                 if (!ok) {
