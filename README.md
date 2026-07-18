@@ -2,6 +2,8 @@
 
 ⚠️ **BEFORE PEOPLE COMPLAIN: CLAUDE DOCUMENTED THE CODE AND WROTE THE DOCS!** ⚠️
 
+**Please note that this is not a production ready project, it is merely a learning resource.**
+
 miniSVM is a tiny, heavily-commented **Type-1 hypervisor** written from nothing.
 It boots as a UEFI application, enters **AMD-V (SVM)**, virtualizes its *own*
 running code, survives the OS handoff, and then **boots a real, unmodified
